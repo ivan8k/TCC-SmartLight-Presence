@@ -13,6 +13,7 @@
 #include <driver/adc.h>
 #include <driver/rtc_io.h>
 #include <driver/spi_master.h>
+//#include <driver/rtc_cntl.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/event_groups.h>
@@ -21,16 +22,21 @@
 #include <esp_wifi.h>
 #include <esp_event.h>
 #include <esp_log.h>
-#include "esp_err.h" // 
+#include <esp_err.h> // 
 #include <esp_netif.h>
+#include <esp_intr_alloc.h>
 #include <lwip/err.h>
 #include <lwip/sockets.h>
 #include <nvs.h>
 #include <nvs_flash.h>
 #include <soc/sens_reg.h>
 #include <soc/rtc_periph.h>
+#include <soc/rtc.h>
 #include <esp32/ulp.h>
 #include <ulp_main.h>
+//#include <soc/rtc_cntl_reg.h>
+//#include <soc/rtc_io_reg.h>
+//#include <soc/soc_ulp.h>
 
 #include <lwip/err.h>
 #include <lwip/sys.h>
@@ -57,6 +63,13 @@ extern const uint8_t ulp_main_bin_end[]   asm("_binary_ulp_main_bin_end");
 static int s_retry_num = 0;
 
 static const char* TAG = "TEST";
+
+/*static void IRAM_ATTR rtc_intr_handler(void* arg)
+{
+    ulp_main_cpu_awake = 1;
+    printf("interrupt\n");
+    (void)arg;
+}*/
 
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
@@ -144,10 +157,13 @@ void tcp_test()//void* pvParameters)
     //static const char* test_payload = "POST /v2/entities HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length:28\r\n\r\n"
     //                                "{\"id\":\"Test2\",\"type\":\"Test\"}";
     //static const char* test_payload = "test package";
-    char test_payload[50];
-    sprintf(test_payload, "test package #%i", ulp_pir_sensor_reading & UINT16_MAX);
+    //char test_payload[50];
+    //sprintf(test_payload, "test package #%i", ulp_pir_sensor_readings & UINT16_MAX);
     //ESP_LOGI(test_payload, "");
-
+    printf("||| TRYING TO CONNECT |||\n");
+    //printf(test_payload);
+    //printf("\n");
+    /*
     int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     struct sockaddr_in addr;
     addr.sin_addr.s_addr = inet_addr(HOST_IP);
@@ -170,23 +186,30 @@ void tcp_test()//void* pvParameters)
         ESP_LOGE(TAG, "Send error: %d", errno);
         return;
     }
-    /*char recv_buffer[128];
+    char recv_buffer[128];
     int len = recv(sock, recv_buffer, sizeof(recv_buffer)-1, 0);
     if (len < 0)
     {
         ESP_LOGE(TAG, "Recv error: %d", errno);
         return;
-    }*/
+    }
     if (sock != -1)
     {
         ESP_LOGI(TAG, "Transmission Concluded.");
         shutdown(sock, 0);
         close(sock);
-    }
+    }*/
 }
 
 void init_ulp_program()
 {
+    //SET_PERI_REG_MASK(RTC_CNTL_INT_ENA_REG, RTC_CNTL_ULP_CP_INT_ENA);
+    //REG_SET_BIT(RTC_CNTL_INT_ENA_REG, RTC_CNTL_ULP_CP_INT_ENA);
+    //ESP_ERROR_CHECK(esp_intr_alloc(ETS_RTC_CORE_INTR_SOURCE, 0/*ESP_INTR_FLAG_LOWMED*/, rtc_intr_handler, NULL, NULL));
+    //ESP_ERROR_CHECK(rtc_isr_register(rtc_intr_handler, NULL, RTC_CNTL_ULP_CP_INT_ENA));
+    //uint32_t rtc_8md256_period = rtc_clk_cal(RTC_CAL_8MD256, 100);
+    //uint32_t rtc_fast_freq_hz = 1000000ULL * (1 << RTC_CLK_CAL_FRACT) * 256 / rtc_8md256_period; // 8680393
+
     adc_power_on();
     adc1_config_width(ADC_WIDTH_BIT_12);
     adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11);
@@ -201,9 +224,18 @@ void init_ulp_program()
     int rtcio_num_pir = rtc_io_number_get(gpio_num_pir);
     //int rtcio_num_ldr = rtc_io_number_get(gpio_num_ldr);
 
-    ulp_pir_sensor_reading = 0;
+    ulp_pir_sensor_readings = 0;
+    ulp_pir_sensor_reading_number = 0;
     ulp_ldr_sensor_readings = 0;
+    *(&ulp_ldr_sensor_readings+1) = 0;
+    ulp_ldr_sensor_reading_number = 0;
     ulp_pir_io_number = rtcio_num_pir;
+    ulp_general_counter = 0;
+    ulp_finished_handling_data = 0;
+    ulp_main_cpu_awake = 1;
+    ulp_data_loss = 0;
+
+    ulp_debug = 0;
 
     rtc_gpio_init(gpio_num_pir);
     rtc_gpio_init(gpio_num_ldr);
@@ -220,23 +252,26 @@ void init_ulp_program()
     rtc_gpio_isolate(GPIO_NUM_15);
     esp_deep_sleep_disable_rom_logging();
 
-    ulp_set_wakeup_period(0, 2000000);
+    //ulp_set_wakeup_period(0, 50);
+    ulp_set_wakeup_period(0, 100000);
 
     err = ulp_run(&ulp_start - RTC_SLOW_MEM);
+    printf("||| START COUNT |||\n");
     ESP_ERROR_CHECK(err);
 }
 
 void app_main()
 {
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    ulp_main_cpu_awake = 1;
 
-    if (cause != ESP_SLEEP_WAKEUP_ULP)
+    if (cause != ESP_SLEEP_WAKEUP_ULP && cause != ESP_SLEEP_WAKEUP_TIMER)
     {
         ESP_LOGI(TAG, "Initializing ULP.");
         init_ulp_program();
     }
     else
-    {
+    {/*
         ESP_LOGI(TAG, "Waking up, trying to send package.");
         esp_err_t ret = nvs_flash_init();
         if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
@@ -247,17 +282,36 @@ void app_main()
         ESP_ERROR_CHECK(ret);
 
         ESP_ERROR_CHECK(esp_netif_init());
-        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        ESP_ERROR_CHECK(esp_event_loop_create_default());*/
 
-        wifi_init_sta();
+        //wifi_init_sta();
         tcp_test();
-        esp_wifi_stop();
+        //esp_wifi_stop();
     }
     ESP_LOGI(TAG, "Entering deep sleep.");
     ESP_ERROR_CHECK(esp_sleep_enable_ulp_wakeup());
-    ESP_LOGI(TAG, "LOG 1.");
+    //ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(60000000));
+    //unsigned long aux = 0;
+    unsigned long tst, tst2;
+    unsigned long fck;
+    //while (1)
+    for (int fkfk = 0; fkfk<2; fkfk++)
+    {
+        //printf("|| %lu ||\n", (unsigned long) (ulp_main_cpu_awake & UINT16_MAX));
+        fck = ulp_ldr_sensor_reading_number & UINT16_MAX;
+        tst = *(&ulp_ldr_sensor_readings+0) & UINT16_MAX;
+        tst2 = *(&ulp_ldr_sensor_readings+1) & UINT16_MAX;
+        //if (aux != tst)
+        {
+            //aux = tst;
+            printf("||| %lu, %lu, %lu |||\n", tst, tst2, fck);
+        }
+        /*if (tst > 500)
+            ulp_main_cpu_awake = 0;*/
+        vTaskDelay(5000 / portTICK_PERIOD_MS);
+    }
+    ulp_main_cpu_awake = 0;
     esp_deep_sleep_start();
-    ESP_LOGI(TAG, "LOG 2.");
     /*
     printf("Hello world!\n");
 
